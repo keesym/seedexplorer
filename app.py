@@ -8,10 +8,10 @@ import numpy as np
 import pandas as pd
 from itertools import islice
 from collections import Counter
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
 import nltk
 
 nltk.download("stopwords", quiet=True)
@@ -19,100 +19,27 @@ nltk.download("punkt", quiet=True)
 nltk.download("punkt_tab", quiet=True)
 
 st.set_page_config(page_title="Query Builder", page_icon="🔍", layout="wide")
-
 st.title("🔍 Query Builder Tool")
 st.caption("AI-powered keyword discovery for social media & Brandwatch queries")
 
-# ── Session state init ────────────────────────────────────────
-for key in ["approved_keywords", "candidate_keywords", "all_similarity_scores",
-            "brandwatch_query", "pipeline_done", "df_seed", "collection_name"]:
+# ── Session state ─────────────────────────────────────────────
+for key in ["concept_phrases", "approved_keywords", "candidate_keywords",
+            "all_similarity_scores", "brandwatch_query", "pipeline_done",
+            "df_seed", "collection_name", "confirm_delete"]:
     if key not in st.session_state:
         st.session_state[key] = None
 
-# ── SIDEBAR ───────────────────────────────────────────────────
-with st.sidebar:
-    st.header("🔑 Credentials")
-    st.caption("Your keys are never stored — session only.")
-    openai_key  = st.text_input("OpenAI API Key",  type="password", placeholder="sk-...")
-    qdrant_url  = st.text_input("Qdrant URL",       placeholder="https://xyz.qdrant.io")
-    qdrant_key  = st.text_input("Qdrant API Key",   type="password", placeholder="your-qdrant-key")
-
-    st.divider()
-    st.header("⚙️ Settings")
-    similarity_threshold = st.slider(
-        "Similarity Threshold",
-        min_value=0.20, max_value=0.80, value=0.45, step=0.05,
-        help="How closely must a keyword match your objective. Loose ← 0.45 → Strict"
-    )
-    freq_pct = st.number_input(
-        "N-gram Frequency Filter %",
-        min_value=0.01, max_value=5.0, value=0.2, step=0.01,
-        help="Only keep n-grams appearing in at least this % of rows"
-    )
-
-    st.divider()
-    st.header("🗑️ Database")
-    if st.button("Clean Database", type="secondary", use_container_width=True):
-        st.session_state["confirm_delete"] = True
-
-    if st.session_state.get("confirm_delete"):
-        st.warning("This will delete ALL collections from your Qdrant instance.")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Yes, Delete All", type="primary", use_container_width=True):
-                try:
-                    client = QdrantClient(url=qdrant_url, api_key=qdrant_key)
-                    cols   = client.get_collections().collections
-                    for c in cols:
-                        client.delete_collection(c.name)
-                    st.success(f"Deleted {len(cols)} collection(s).")
-                    st.session_state["confirm_delete"] = False
-                except Exception as e:
-                    st.error(f"Error: {e}")
-        with col2:
-            if st.button("Cancel", use_container_width=True):
-                st.session_state["confirm_delete"] = False
-
-# ── STEP 1 — Objective ────────────────────────────────────────
-st.header("Step 1 — Research Objective")
-objective = st.text_area(
-    "Describe what you want to find. Include what is relevant and what should be excluded.",
-    placeholder="Example: We want to capture all conversations about textile — materials and finished products. Excludes leather.",
-    height=100
-)
-
-# ── STEP 2 — Upload File ──────────────────────────────────────
-st.header("Step 2 — Upload Seed Data")
-uploaded_file = st.file_uploader("Upload your Excel (.xlsx) or CSV file", type=["xlsx", "csv"])
-
-selected_column = None
-if uploaded_file:
-    try:
-        if uploaded_file.name.endswith(".csv"):
-            df = pd.read_csv(uploaded_file)
-        else:
-            df = pd.read_excel(uploaded_file)
-        st.session_state["df_seed"] = df
-        st.success(f"✅ **{uploaded_file.name}** — {len(df):,} rows, {len(df.columns)} columns")
-        selected_column = st.selectbox("Select the column containing your text data", df.columns.tolist())
-        min_count = max(1, int(len(df) * freq_pct / 100))
-        st.caption(f"At {freq_pct}% frequency filter → n-grams must appear in at least {min_count:,} rows")
-    except Exception as e:
-        st.error(f"Could not read file: {e}")
-
-# ── STEP 3 — Run Pipeline ─────────────────────────────────────
-st.header("Step 3 — Run Pipeline")
-
+# ── Helpers ───────────────────────────────────────────────────
 def batch_list(lst, size):
     it = iter(lst)
     return list(iter(lambda: list(islice(it, size)), []))
 
-def embed_texts(client_openai, texts, batch_size=500):
-    all_vectors = []
+def embed_texts(client, texts, batch_size=500):
+    vectors = []
     for batch in batch_list(texts, batch_size):
-        resp = client_openai.embeddings.create(model="text-embedding-3-small", input=batch)
-        all_vectors.extend([r.embedding for r in resp.data])
-    return all_vectors
+        resp = client.embeddings.create(model="text-embedding-3-small", input=batch)
+        vectors.extend([r.embedding for r in resp.data])
+    return vectors
 
 def extract_ngrams(texts, max_n=4, freq_pct=0.2):
     stop_words   = set(stopwords.words("english"))
@@ -129,106 +56,190 @@ def extract_ngrams(texts, max_n=4, freq_pct=0.2):
                     row_ngrams.add(gram)
         ngram_counts.update(row_ngrams)
     min_count = max(1, int(len(texts) * freq_pct / 100))
-    return [g for g, c in ngram_counts.items() if c >= min_count], len(ngram_counts), min_count
+    kept = [g for g, c in ngram_counts.items() if c >= min_count]
+    return kept, len(ngram_counts), min_count
 
-if st.button("▶ Run Pipeline", type="primary", disabled=not (objective and selected_column and openai_key and qdrant_url and qdrant_key)):
-    if not objective:
-        st.error("Please enter a research objective.")
-    elif not selected_column:
-        st.error("Please upload a file and select a column.")
-    else:
-        df = st.session_state["df_seed"]
+# ── SIDEBAR ───────────────────────────────────────────────────
+with st.sidebar:
+    st.header("🔑 Credentials")
+    st.caption("Stored in session only — never saved.")
+    openai_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
+    qdrant_url = st.text_input("Qdrant URL", placeholder="https://xyz.qdrant.io")
+    qdrant_key = st.text_input("Qdrant API Key", type="password", placeholder="your-qdrant-key")
+
+    st.divider()
+    st.header("⚙️ Settings")
+    similarity_threshold = st.slider("Similarity Threshold", 0.20, 0.80, 0.45, 0.05,
+        help="Loose 0.20 — Balanced 0.45 — Strict 0.80")
+    freq_pct = st.number_input("N-gram Frequency %", min_value=0.01, max_value=5.0, value=0.2, step=0.01,
+        help="N-grams must appear in at least this % of rows")
+
+    st.divider()
+    st.header("🗑️ Clean Database")
+    if st.button("Delete All Collections", use_container_width=True):
+        st.session_state["confirm_delete"] = True
+    if st.session_state.get("confirm_delete"):
+        st.warning("Deletes ALL Qdrant collections. Cannot be undone.")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Yes, Delete", type="primary", use_container_width=True):
+                try:
+                    client = QdrantClient(url=qdrant_url, api_key=qdrant_key)
+                    cols = client.get_collections().collections
+                    for c in cols:
+                        client.delete_collection(c.name)
+                    st.success(f"Deleted {len(cols)} collection(s).")
+                    st.session_state["confirm_delete"] = False
+                except Exception as e:
+                    st.error(str(e))
+        with c2:
+            if st.button("Cancel", use_container_width=True):
+                st.session_state["confirm_delete"] = False
+
+# ── STEP 1 — Objective ────────────────────────────────────────
+st.header("Step 1 — Research Objective")
+objective = st.text_area(
+    "Describe what you want to find. Include what is relevant and what should be excluded.",
+    placeholder="Example: Capture conversations about textile — materials and finished products. Excludes leather.",
+    height=100
+)
+
+# ── STEP 2 — Upload File ──────────────────────────────────────
+st.header("Step 2 — Upload Seed Data")
+uploaded_file   = st.file_uploader("Upload Excel (.xlsx) or CSV", type=["xlsx", "csv"])
+selected_column = None
+
+if uploaded_file:
+    try:
+        df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
+        st.session_state["df_seed"] = df
+        min_count = max(1, int(len(df) * freq_pct / 100))
+        st.success(f"✅ **{uploaded_file.name}** — {len(df):,} rows, {len(df.columns)} columns")
+        selected_column = st.selectbox("Select the column containing your text data", df.columns.tolist())
+        st.caption(f"At {freq_pct}% → n-grams must appear in at least {min_count:,} rows")
+    except Exception as e:
+        st.error(f"Could not read file: {e}")
+
+# ── STEP 3a — Extract Concept Phrases ────────────────────────
+st.header("Step 3 — Run Pipeline")
+
+if st.button("🔍 Extract Concept Phrases", type="primary",
+             disabled=not (objective and selected_column and openai_key)):
+    try:
+        client_openai = openai.OpenAI(api_key=openai_key)
+        with st.spinner("Extracting concept phrases..."):
+            resp = client_openai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": (
+                    "You are helping build a keyword search query. "
+                    "Extract 3 to 5 short concept phrases (2-4 words each) that represent ONLY the topics "
+                    "and themes the user wants to FIND and INCLUDE. "
+                    "Do NOT extract exclusion criteria or anything the user wants to avoid. "
+                    "Return only a JSON array of strings, nothing else.\n\n"
+                    f"Objective: {objective}"
+                )}],
+                max_tokens=200
+            )
+            phrases = json.loads(re.sub(r"```json|```", "", resp.choices[0].message.content.strip()).strip())
+            st.session_state["concept_phrases"] = phrases
+            st.session_state["pipeline_done"]   = False
+    except openai.AuthenticationError:
+        st.error("Invalid OpenAI API key.")
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+# ── STEP 3b — Review & Edit Concept Phrases ──────────────────
+if st.session_state.get("concept_phrases") is not None:
+    st.subheader("Review Concept Phrases")
+    st.caption("Edit, remove, or add phrases before running. These become your search anchor.")
+
+    phrases         = st.session_state["concept_phrases"]
+    updated_phrases = []
+
+    for i, phrase in enumerate(phrases):
+        col1, col2 = st.columns([8, 1])
+        with col1:
+            edited = st.text_input(f"phrase_{i}", value=phrase, key=f"phrase_{i}", label_visibility="collapsed")
+        with col2:
+            remove = st.button("✕", key=f"rm_{i}")
+        if not remove and edited.strip():
+            updated_phrases.append(edited.strip())
+
+    new_phrase = st.text_input("➕ Add a phrase", placeholder="e.g. woven fabric", key="new_phrase")
+    if new_phrase.strip() and new_phrase.strip() not in updated_phrases:
+        updated_phrases.append(new_phrase.strip())
+
+    st.session_state["concept_phrases"] = updated_phrases
+    st.caption(f"{len(updated_phrases)} phrase(s) will be embedded as your anchor vector")
+
+    # ── STEP 3c — Run Full Pipeline ───────────────────────────
+    if st.button("▶ Run Pipeline with These Phrases", type="primary",
+                 disabled=len(updated_phrases) == 0):
+        df    = st.session_state["df_seed"]
         texts = df[selected_column].dropna().astype(str).str.strip().replace("", pd.NA).dropna().tolist()
 
+        pipeline_error = None
         try:
             client_openai = openai.OpenAI(api_key=openai_key)
             client_qdrant = QdrantClient(url=qdrant_url, api_key=qdrant_key)
 
-            # Step 1 — Concept phrases
-            with st.status("🔍 Extracting concept phrases...", expanded=True) as status:
-                resp = client_openai.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": (
-                        "You are helping build a keyword search query. "
-                        "Extract 3 to 5 short concept phrases (2-4 words each) that represent ONLY the topics "
-                        "and themes the user wants to FIND and INCLUDE. "
-                        "Do NOT extract exclusion criteria or anything the user wants to avoid. "
-                        "Return only a JSON array of strings, nothing else.\n\n"
-                        f"Objective: {objective}"
-                    )}],
-                    max_tokens=200
-                )
-                concept_phrases = json.loads(re.sub(r"```json|```", "", resp.choices[0].message.content.strip()).strip())
-                st.write(f"✅ Concept phrases: `{concept_phrases}`")
-
-                # Step 2 — Anchor vector
+            with st.status("Running pipeline...", expanded=True) as status:
                 st.write("🧲 Embedding concept phrases...")
-                phrase_vectors = embed_texts(client_openai, concept_phrases)
+                phrase_vectors = embed_texts(client_openai, updated_phrases)
                 anchor_vector  = list(np.mean(phrase_vectors, axis=0))
                 st.write("✅ Anchor vector ready.")
 
-                # Step 3 — N-grams
                 st.write(f"📄 Extracting n-grams from {len(texts):,} rows...")
-                ngrams, total_ngrams, min_count = extract_ngrams(texts, max_n=4, freq_pct=freq_pct)
-                st.write(f"✅ {total_ngrams:,} unique n-grams → **{len(ngrams):,} kept** after frequency filter (min {min_count:,} rows)")
+                ngrams, total, min_ct = extract_ngrams(texts, max_n=4, freq_pct=freq_pct)
+                st.write(f"✅ {total:,} unique n-grams → **{len(ngrams):,} kept** (min {min_ct:,} rows)")
 
-                # Step 4 — Embed & upload
-                st.write("☁️ Embedding n-grams & uploading to Qdrant...")
-                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                collection_name = f"run_{ts}"
+                st.write("☁️ Embedding & uploading to Qdrant...")
+                ts    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                cname = f"run_{ts}"
                 existing = [c.name for c in client_qdrant.get_collections().collections]
-                if collection_name in existing:
-                    collection_name += f"_{int(time.time()) % 10000}"
+                if cname in existing:
+                    cname += f"_{int(time.time()) % 10000}"
+                client_qdrant.create_collection(cname, vectors_config=VectorParams(size=1536, distance=Distance.COSINE))
+                st.write(f"Collection: `{cname}`")
+                st.session_state["collection_name"] = cname
 
-                client_qdrant.create_collection(
-                    collection_name=collection_name,
-                    vectors_config=VectorParams(size=1536, distance=Distance.COSINE)
-                )
-                st.write(f"Collection: `{collection_name}`")
-
-                ngram_vectors = embed_texts(client_openai, ngrams)
-                progress = st.progress(0)
-                batches  = batch_list(list(zip(ngrams, ngram_vectors)), 100)
-                for i, batch in enumerate(batches):
-                    client_qdrant.upsert(
-                        collection_name=collection_name,
-                        points=[PointStruct(id=abs(hash(g)) % (2**63), vector=v, payload={"ngram": g, "ngram_length": len(g.split())}) for g, v in batch]
-                    )
-                    progress.progress((i + 1) / len(batches))
+                ngram_vectors  = embed_texts(client_openai, ngrams)
+                prog           = st.progress(0)
+                upload_batches = batch_list(list(zip(ngrams, ngram_vectors)), 100)
+                for i, batch in enumerate(upload_batches):
+                    client_qdrant.upsert(cname, points=[
+                        PointStruct(id=abs(hash(g)) % (2**63), vector=v,
+                                    payload={"ngram": g, "ngram_length": len(g.split())})
+                        for g, v in batch
+                    ])
+                    prog.progress((i + 1) / len(upload_batches))
                 st.write("✅ Uploaded.")
-                st.session_state["collection_name"] = collection_name
 
-                # Step 5 — Similarity search
                 st.write("🔎 Running similarity search...")
-                search_result = client_qdrant.query_points(
-                    collection_name=collection_name,
-                    query=anchor_vector,
-                    limit=min(len(ngrams), 10000),
-                    with_payload=True
-                )
-                all_scores = {r.payload["ngram"]: round(r.score, 4) for r in search_result.points}
+                result     = client_qdrant.query_points(cname, query=anchor_vector,
+                                                        limit=min(len(ngrams), 10000), with_payload=True)
+                all_scores = {r.payload["ngram"]: round(r.score, 4) for r in result.points}
                 above      = {k: v for k, v in all_scores.items() if v >= similarity_threshold}
-                st.write(f"✅ {len(above):,} candidates above threshold {similarity_threshold:.2f}")
                 st.session_state["all_similarity_scores"] = all_scores
+                st.write(f"✅ {len(above):,} candidates above threshold {similarity_threshold:.2f}")
 
-                # Step 6 — GPT filtering
                 st.write("🤖 GPT keyword approval...")
-                candidates = list(above.keys())
-                MAX_TOKENS = 25000
-                batches_gpt, current, tokens = [], [], 0
+                candidates  = list(above.keys())
+                MAX_TOKENS  = 25000
+                gpt_batches, current, tokens = [], [], 0
                 for term in candidates:
                     t = len(term) // 4
                     if tokens + t > MAX_TOKENS and current:
-                        batches_gpt.append(current); current = [term]; tokens = t
+                        gpt_batches.append(current); current = [term]; tokens = t
                     else:
                         current.append(term); tokens += t
                 if current:
-                    batches_gpt.append(current)
+                    gpt_batches.append(current)
 
                 approved = []
-                gpt_progress = st.progress(0)
-                for i, batch in enumerate(batches_gpt):
-                    st.write(f"Processing batch {i+1} of {len(batches_gpt)}...")
+                gpt_prog = st.progress(0)
+                for i, batch in enumerate(gpt_batches):
+                    st.write(f"Batch {i+1} of {len(gpt_batches)}...")
                     for attempt in range(2):
                         try:
                             r = client_openai.chat.completions.create(
@@ -242,19 +253,23 @@ if st.button("▶ Run Pipeline", type="primary", disabled=not (objective and sel
                                 )}],
                                 max_tokens=4000
                             )
-                            approved.extend(json.loads(re.sub(r"```json|```", "", r.choices[0].message.content.strip()).strip()))
+                            approved.extend(json.loads(re.sub(r"```json|```", "",
+                                r.choices[0].message.content.strip()).strip()))
                             break
-                        except:
+                        except Exception:
                             if attempt == 1:
                                 st.warning(f"Batch {i+1} skipped after retry.")
-                    gpt_progress.progress((i + 1) / len(batches_gpt))
+                    gpt_prog.progress((i + 1) / len(gpt_batches))
 
                 st.session_state["candidate_keywords"] = list(dict.fromkeys(approved))
                 st.session_state["pipeline_done"]      = True
-                status.update(label=f"✅ Pipeline complete — {len(st.session_state['candidate_keywords'])} keywords found", state="complete")
+                status.update(
+                    label=f"✅ Done — {len(st.session_state['candidate_keywords'])} keywords found",
+                    state="complete"
+                )
 
         except openai.AuthenticationError:
-            st.error("Invalid OpenAI API key. Check your credentials in the sidebar.")
+            st.error("Invalid OpenAI API key.")
         except Exception as e:
             st.error(f"Error: {e}")
 
@@ -265,27 +280,18 @@ if st.session_state.get("pipeline_done") and st.session_state["candidate_keyword
     all_scores = st.session_state["all_similarity_scores"] or {}
     candidates = st.session_state["candidate_keywords"]
 
-    review_threshold = st.slider(
-        "Adjust threshold to expand or narrow the list",
-        min_value=0.20, max_value=0.80, value=similarity_threshold, step=0.05,
-        key="review_threshold"
-    )
-
+    review_threshold = st.slider("Adjust threshold", 0.20, 0.80, similarity_threshold, 0.05,
+                                  key="review_threshold")
     filtered = sorted(
         [k for k in candidates if all_scores.get(k, 0) >= review_threshold],
         key=lambda k: all_scores.get(k, 0), reverse=True
     )
 
     MIN_KEYWORDS = 20
-    st.caption(f"**{len(filtered)} keywords** at threshold {review_threshold:.2f} {'✅' if len(filtered) >= MIN_KEYWORDS else f'— need at least {MIN_KEYWORDS}'}")
+    st.caption(f"**{len(filtered)} keywords** at threshold {review_threshold:.2f} "
+               f"{'✅' if len(filtered) >= MIN_KEYWORDS else f'— need at least {MIN_KEYWORDS}'}")
 
-    to_remove = st.multiselect(
-        "Select keywords to remove (then click Approve below)",
-        options=filtered,
-        default=[],
-        help="Hold Ctrl/Cmd to select multiple"
-    )
-
+    to_remove      = st.multiselect("Select keywords to remove", options=filtered, default=[])
     final_keywords = [k for k in filtered if k not in to_remove]
     st.caption(f"{len(final_keywords)} keywords will be approved")
 
@@ -323,27 +329,21 @@ if st.session_state.get("approved_keywords"):
 
     if st.session_state.get("brandwatch_query"):
         bw_query = st.session_state["brandwatch_query"]
-
         col1, col2 = st.columns(2)
 
         with col1:
             st.subheader("Social Media Keywords")
             hashtag_mode = st.toggle("Hashtag mode (#CamelCase)")
-            if hashtag_mode:
-                social_list = "\n".join(["#" + "".join(w.capitalize() for w in kw.split()) for kw in approved])
-            else:
-                social_list = "\n".join(approved)
-            st.text_area("Copy your keywords", value=social_list, height=300, key="social_output")
+            social_list  = "\n".join(
+                ["#" + "".join(w.capitalize() for w in kw.split()) for kw in approved]
+                if hashtag_mode else approved
+            )
+            st.text_area("Copy your keywords", value=social_list, height=300, key="social_out")
 
         with col2:
             st.subheader("Brandwatch Query")
-            st.text_area("Copy your query", value=bw_query, height=300, key="bw_output")
+            st.text_area("Copy your query", value=bw_query, height=300, key="bw_out")
 
-        # Download
-        download_content = f"=== SOCIAL MEDIA KEYWORDS ===\n{chr(10).join(approved)}\n\n=== BRANDWATCH QUERY ===\n{bw_query}\n"
-        st.download_button(
-            label="💾 Download as .txt",
-            data=download_content,
-            file_name="query_builder_output.txt",
-            mime="text/plain"
-        )
+        download_txt = f"=== SOCIAL MEDIA KEYWORDS ===\n{chr(10).join(approved)}\n\n=== BRANDWATCH QUERY ===\n{bw_query}\n"
+        st.download_button("💾 Download as .txt", data=download_txt,
+                           file_name="query_builder_output.txt", mime="text/plain")
