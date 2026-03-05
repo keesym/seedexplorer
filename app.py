@@ -23,7 +23,8 @@ st.title("🔍 Query Builder Tool")
 st.caption("AI-powered keyword discovery for social media & Brandwatch queries")
 
 # ── Session state ─────────────────────────────────────────────
-for key in ["concept_phrases", "approved_keywords", "candidate_keywords",
+for key in ["concept_phrases", "phrases_from_objective", "phrases_ai_expansions",
+            "approved_keywords", "candidate_keywords",
             "all_similarity_scores", "brandwatch_query", "pipeline_done",
             "df_seed", "collection_name", "confirm_delete"]:
     if key not in st.session_state:
@@ -69,9 +70,9 @@ with st.sidebar:
 
     st.divider()
     st.header("⚙️ Settings")
-    similarity_threshold = st.slider("Similarity Threshold", 0.20, 0.80, 0.20, 0.05,
+    similarity_threshold = st.slider("Similarity Threshold", 0.20, 0.80, 0.45, 0.05,
         help="Loose 0.20 — Balanced 0.45 — Strict 0.80")
-    freq_pct = st.number_input("N-gram Frequency %", min_value=0.005, max_value=5.0, value=0.05, step=0.001,
+    freq_pct = st.number_input("N-gram Frequency %", min_value=0.01, max_value=5.0, value=0.2, step=0.01,
         help="N-grams must appear in at least this % of rows")
 
     st.divider()
@@ -128,49 +129,73 @@ if st.button("🔍 Extract Concept Phrases", type="primary",
     try:
         client_openai = openai.OpenAI(api_key=openai_key)
         with st.spinner("Extracting concept phrases..."):
-            resp = client_openai.chat.completions.create(
+
+            # From objective
+            resp_obj = client_openai.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": (
                     "You are helping build a keyword search query. "
-                    "Extract 3 to 5 short concept phrases (2-4 words each) that represent ONLY the topics "
-                    "and themes the user wants to FIND and INCLUDE. "
+                    "Extract as many short concept phrases (2-4 words each) as are genuinely present in this objective. "
+                    "Only extract topics and themes the user wants to FIND and INCLUDE. "
                     "Do NOT extract exclusion criteria or anything the user wants to avoid. "
                     "Return only a JSON array of strings, nothing else.\n\n"
                     f"Objective: {objective}"
                 )}],
-                max_tokens=200
+                max_tokens=1000
             )
-            phrases = json.loads(re.sub(r"```json|```", "", resp.choices[0].message.content.strip()).strip())
-            st.session_state["concept_phrases"] = phrases
-            st.session_state["pipeline_done"]   = False
+            from_objective = json.loads(re.sub(r"```json|```", "", resp_obj.choices[0].message.content.strip()).strip())
+
+            # AI expansions
+            resp_exp = client_openai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": (
+                    "You are helping expand a keyword search query. "
+                    "Based on the research objective below, suggest as many related concept phrases "
+                    "(2-4 words each) as are relevant — covering adjacent topics, synonyms, subcategories, "
+                    "and related themes that the user did NOT explicitly mention but would likely want to capture. "
+                    "Do NOT repeat phrases already in the objective. "
+                    "Do NOT include exclusion criteria. "
+                    "Return only a JSON array of strings, nothing else.\n\n"
+                    f"Objective: {objective}"
+                )}],
+                max_tokens=1000
+            )
+            ai_expansions = json.loads(re.sub(r"```json|```", "", resp_exp.choices[0].message.content.strip()).strip())
+
+            st.session_state["phrases_from_objective"] = from_objective
+            st.session_state["phrases_ai_expansions"]  = ai_expansions
+            st.session_state["pipeline_done"]          = False
+
     except openai.AuthenticationError:
         st.error("Invalid OpenAI API key.")
     except Exception as e:
         st.error(f"Error: {e}")
 
 # ── STEP 3b — Review & Edit Concept Phrases ──────────────────
-if st.session_state.get("concept_phrases") is not None:
+if st.session_state.get("phrases_from_objective") is not None:
     st.subheader("Review Concept Phrases")
-    st.caption("Edit, remove, or add phrases before running. These become your search anchor.")
+    st.caption("Edit freely — one phrase per line. Delete a line to remove, type a new line to add. Both lists will be merged into your anchor vector.")
 
-    phrases         = st.session_state["concept_phrases"]
-    updated_phrases = []
+    col_obj, col_ai = st.columns(2)
 
-    for i, phrase in enumerate(phrases):
-        col1, col2 = st.columns([8, 1])
-        with col1:
-            edited = st.text_input(f"phrase_{i}", value=phrase, key=f"phrase_{i}", label_visibility="collapsed")
-        with col2:
-            remove = st.button("✕", key=f"rm_{i}")
-        if not remove and edited.strip():
-            updated_phrases.append(edited.strip())
+    with col_obj:
+        st.markdown("**📌 From your objective**")
+        obj_default = "\n".join(st.session_state["phrases_from_objective"])
+        obj_text    = st.text_area("From objective", value=obj_default, height=300,
+                                    key="ta_objective", label_visibility="collapsed")
 
-    new_phrase = st.text_input("➕ Add a phrase", placeholder="e.g. woven fabric", key="new_phrase")
-    if new_phrase.strip() and new_phrase.strip() not in updated_phrases:
-        updated_phrases.append(new_phrase.strip())
+    with col_ai:
+        st.markdown("**🤖 AI suggested expansions**")
+        ai_default = "\n".join(st.session_state["phrases_ai_expansions"])
+        ai_text    = st.text_area("AI expansions", value=ai_default, height=300,
+                                   key="ta_expansions", label_visibility="collapsed")
 
-    st.session_state["concept_phrases"] = updated_phrases
-    st.caption(f"{len(updated_phrases)} phrase(s) will be embedded as your anchor vector")
+    # Merge both into flat deduplicated list
+    obj_lines = [l.strip() for l in obj_text.splitlines() if l.strip()]
+    ai_lines  = [l.strip() for l in ai_text.splitlines() if l.strip()]
+    updated_phrases = list(dict.fromkeys(obj_lines + ai_lines))
+
+    st.caption(f"{len(obj_lines)} from objective + {len(ai_lines)} AI suggestions = **{len(updated_phrases)} total phrases** going into anchor vector")
 
     # ── STEP 3c — Run Full Pipeline ───────────────────────────
     if st.button("▶ Run Pipeline with These Phrases", type="primary",
