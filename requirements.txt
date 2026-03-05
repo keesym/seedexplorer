@@ -1,0 +1,7 @@
+streamlit
+openai
+qdrant-client
+nltk
+pandas
+openpyxl
+numpy
