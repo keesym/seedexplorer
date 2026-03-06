@@ -18,6 +18,41 @@ nltk.download("stopwords", quiet=True)
 nltk.download("punkt", quiet=True)
 nltk.download("punkt_tab", quiet=True)
 
+# Language code to NLTK stopword language name
+LANG_MAP = {
+    "ar": "arabic", "az": "azerbaijani", "eu": "basque", "bn": "bengali",
+    "ca": "catalan", "zh": "chinese", "da": "danish", "nl": "dutch",
+    "en": "english", "fi": "finnish", "fr": "french", "de": "german",
+    "el": "greek", "he": "hebrew", "hu": "hungarian", "id": "indonesian",
+    "it": "italian", "kk": "kazakh", "ne": "nepali", "no": "norwegian",
+    "pt": "portuguese", "ro": "romanian", "ru": "russian", "sl": "slovene",
+    "es": "spanish", "sv": "swedish", "tg": "tajik", "tr": "turkish"
+}
+
+def detect_languages(texts, sample_size=1000):
+    from langdetect import detect, LangDetectException
+    import random
+    sample   = random.sample(texts, min(sample_size, len(texts)))
+    detected = set()
+    for text in sample:
+        try:
+            lang = detect(str(text))
+            if lang in LANG_MAP:
+                detected.add(LANG_MAP[lang])
+        except LangDetectException:
+            pass
+    detected.add("english")
+    return detected
+
+def get_multilingual_stopwords(languages):
+    combined = set()
+    for lang in languages:
+        try:
+            combined.update(stopwords.words(lang))
+        except OSError:
+            pass
+    return combined
+
 st.set_page_config(page_title="Query Builder", page_icon="🔍", layout="wide")
 st.title("🔍 Query Builder Tool")
 st.caption("AI-powered keyword discovery for social media & Brandwatch queries")
@@ -42,8 +77,9 @@ def embed_texts(client, texts, batch_size=500):
         vectors.extend([r.embedding for r in resp.data])
     return vectors
 
-def extract_ngrams(texts, max_n=4, freq_pct=0.2):
-    stop_words   = set(stopwords.words("english"))
+def extract_ngrams(texts, max_n=4, freq_pct=0.2, stop_words=None):
+    if stop_words is None:
+        stop_words = set(stopwords.words("english"))
     ngram_counts = Counter()
     for text in texts:
         tokens = word_tokenize(str(text).lower())
@@ -215,7 +251,11 @@ if st.session_state.get("phrases_from_objective") is not None:
                 st.write("✅ Anchor vector ready.")
 
                 st.write(f"📄 Extracting n-grams from {len(texts):,} rows...")
-                ngrams, total, min_ct = extract_ngrams(texts, max_n=4, freq_pct=freq_pct)
+                st.write("🌍 Detecting languages in dataset...")
+                detected_langs = detect_languages(texts)
+                stop_words     = get_multilingual_stopwords(detected_langs)
+                st.write(f"✅ Languages detected: {', '.join(sorted(detected_langs))} — {len(stop_words):,} stopwords loaded.")
+                ngrams, total, min_ct = extract_ngrams(texts, max_n=4, freq_pct=freq_pct, stop_words=stop_words)
                 st.write(f"✅ {total:,} unique n-grams → **{len(ngrams):,} kept** (min {min_ct:,} rows)")
 
                 st.write("☁️ Embedding & uploading to Qdrant...")
