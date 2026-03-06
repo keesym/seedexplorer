@@ -53,6 +53,30 @@ def get_multilingual_stopwords(languages):
             pass
     return combined
 
+def translate_phrases(client, phrases, target_languages, source_language="english"):
+    """Translate phrases into all target languages silently. Returns flat list of all translations."""
+    non_english = [l for l in target_languages if l != source_language]
+    if not non_english:
+        return phrases
+    all_phrases = list(phrases)
+    lang_list   = ", ".join(non_english)
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": (
+            f"Translate each of the following phrases into these languages: {lang_list}.\n"
+            "Return a flat JSON array containing ALL translations (not the originals). "
+            "One entry per phrase per language. No explanations, no markdown, just the JSON array.\n\n"
+            f"Phrases: {json.dumps(phrases)}"
+        )}],
+        max_tokens=2000
+    )
+    try:
+        translations = json.loads(re.sub(r"```json|```", "", resp.choices[0].message.content.strip()).strip())
+        all_phrases.extend(translations)
+    except Exception:
+        pass  # if translation fails, just use original phrases
+    return list(dict.fromkeys(all_phrases))
+
 st.set_page_config(page_title="Query Builder", page_icon="🔍", layout="wide")
 st.title("🔍 Query Builder Tool")
 st.caption("AI-powered keyword discovery for social media & Brandwatch queries")
@@ -106,9 +130,9 @@ with st.sidebar:
 
     st.divider()
     st.header("⚙️ Settings")
-    similarity_threshold = st.slider("Similarity Threshold", 0.10, 0.80, 0.20, 0.05,
+    similarity_threshold = st.slider("Similarity Threshold", 0.20, 0.80, 0.45, 0.05,
         help="Loose 0.20 — Balanced 0.45 — Strict 0.80")
-    freq_pct = st.number_input("N-gram Frequency %", min_value=0.01, max_value=5.0, value=0.05, step=0.01,
+    freq_pct = st.number_input("N-gram Frequency %", min_value=0.01, max_value=5.0, value=0.2, step=0.01,
         help="N-grams must appear in at least this % of rows")
 
     st.divider()
@@ -249,12 +273,19 @@ if st.session_state.get("phrases_from_objective") is not None:
                 phrase_vectors = embed_texts(client_openai, updated_phrases)
                 anchor_vector  = list(np.mean(phrase_vectors, axis=0))
                 st.write("✅ Anchor vector ready.")
+                detected_langs_list = []  # will be set after language detection
 
                 st.write(f"📄 Extracting n-grams from {len(texts):,} rows...")
                 st.write("🌍 Detecting languages in dataset...")
                 detected_langs = detect_languages(texts)
                 stop_words     = get_multilingual_stopwords(detected_langs)
                 st.write(f"✅ Languages detected: {', '.join(sorted(detected_langs))} — {len(stop_words):,} stopwords loaded.")
+                detected_langs_list = sorted(detected_langs)
+
+                st.write("🌐 Translating anchor phrases into detected languages...")
+                updated_phrases = translate_phrases(client_openai, updated_phrases, detected_langs)
+                st.write(f"✅ Anchor vector will use {len(updated_phrases)} phrases across all languages.")
+
                 ngrams, total, min_ct = extract_ngrams(texts, max_n=4, freq_pct=freq_pct, stop_words=stop_words)
                 st.write(f"✅ {total:,} unique n-grams → **{len(ngrams):,} kept** (min {min_ct:,} rows)")
 
@@ -311,7 +342,10 @@ if st.session_state.get("phrases_from_objective") is not None:
                                 model="gpt-4o-mini",
                                 messages=[{"role": "user", "content": (
                                     f"Given this research objective: {objective}\n\n"
-                                    "From the following list of terms, return ONLY those genuinely relevant. "
+                                    f"The dataset contains text in the following languages: {', '.join(detected_langs_list)}. "
+                                    "A term in ANY of these languages that is relevant to the objective should be kept, regardless of which language it is in. "
+                                    "Do not filter out non-English terms just because they are not in English. "
+                                    "From the following list of terms, return ONLY those genuinely relevant to the objective. "
                                     "Remove duplicates, near-duplicates, and overly generic terms. "
                                     "Return ONLY a flat JSON array of strings, no other text, no markdown.\n\n"
                                     f"Terms: {json.dumps(batch)}"
