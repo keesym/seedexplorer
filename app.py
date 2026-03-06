@@ -6,6 +6,8 @@ import time
 import datetime
 import numpy as np
 import pandas as pd
+import asyncio
+import concurrent.futures
 from itertools import islice
 from collections import Counter
 from qdrant_client import QdrantClient
@@ -13,12 +15,25 @@ from qdrant_client.models import VectorParams, Distance, PointStruct
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 import nltk
+import random
 
 nltk.download("stopwords", quiet=True)
 nltk.download("punkt", quiet=True)
 nltk.download("punkt_tab", quiet=True)
 
-# Language code to NLTK stopword language name
+st.set_page_config(page_title="Query Builder", page_icon="🔍", layout="wide")
+st.title("🔍 Query Builder Tool")
+st.caption("AI-powered multilingual keyword discovery for Brandwatch queries")
+
+# ── Session state ─────────────────────────────────────────────
+for key in ["phrases_from_objective", "phrases_ai_expansions", "labeled_df",
+            "detected_langs", "selected_langs", "pipeline_done",
+            "keywords_by_lang", "approved_by_lang", "brandwatch_query",
+            "df_seed", "confirm_delete"]:
+    if key not in st.session_state:
+        st.session_state[key] = None
+
+# ── Language map ──────────────────────────────────────────────
 LANG_MAP = {
     "ar": "arabic", "az": "azerbaijani", "eu": "basque", "bn": "bengali",
     "ca": "catalan", "zh": "chinese", "da": "danish", "nl": "dutch",
@@ -28,23 +43,64 @@ LANG_MAP = {
     "pt": "portuguese", "ro": "romanian", "ru": "russian", "sl": "slovene",
     "es": "spanish", "sv": "swedish", "tg": "tajik", "tr": "turkish"
 }
+LANG_MAP_INV = {v: k for k, v in LANG_MAP.items()}
 
-def detect_languages(texts, sample_size=1000):
+# ── Helpers ───────────────────────────────────────────────────
+def is_valid_text(text, min_words=5):
+    """Return True if text has 5+ real words (not just emojis/links)."""
+    text = str(text).strip()
+    # Remove URLs
+    text = re.sub(r"http\S+|www\.\S+", "", text)
+    # Remove emojis
+    text = re.sub(r"[^\w\s]", "", text, flags=re.UNICODE)
+    words = [w for w in text.split() if len(w) > 1]
+    return len(words) >= min_words
+
+def detect_lang_single(text):
+    """Detect language of a single text. Returns NLTK lang name or None."""
     from langdetect import detect, LangDetectException
-    import random
-    sample   = random.sample(texts, min(sample_size, len(texts)))
-    detected = set()
-    for text in sample:
-        try:
-            lang = detect(str(text))
-            if lang in LANG_MAP:
-                detected.add(LANG_MAP[lang])
-        except LangDetectException:
-            pass
-    detected.add("english")
-    return detected
+    try:
+        code = detect(str(text))
+        return LANG_MAP.get(code)
+    except LangDetectException:
+        return None
 
-def get_multilingual_stopwords(languages):
+def label_dataframe(df, text_col, sample_size=1000):
+    """
+    Step 1: detect languages from a random sample of valid rows.
+    Step 2: label all valid rows async using ThreadPoolExecutor.
+    Returns df with new '_lang' column.
+    """
+    valid_mask = df[text_col].apply(is_valid_text)
+    valid_df   = df[valid_mask].copy()
+
+    # Sample for detection
+    sample_idx = random.sample(list(valid_df.index), min(sample_size, len(valid_df)))
+    sample_texts = valid_df.loc[sample_idx, text_col].tolist()
+
+    # Detect languages present in sample
+    detected = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        results = list(ex.map(detect_lang_single, sample_texts))
+    for r in results:
+        if r:
+            detected.add(r)
+    detected.add("english")
+
+    # Label ALL valid rows async
+    all_texts = valid_df[text_col].tolist()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
+        labels = list(ex.map(detect_lang_single, all_texts))
+
+    valid_df["_lang"] = labels
+    # Rows that couldn't be detected → mark as None (excluded)
+    df = df.copy()
+    df["_lang"] = None
+    df.loc[valid_df.index, "_lang"] = valid_df["_lang"].values
+
+    return df, detected
+
+def get_stopwords(languages):
     combined = set()
     for lang in languages:
         try:
@@ -53,43 +109,6 @@ def get_multilingual_stopwords(languages):
             pass
     return combined
 
-def translate_phrases(client, phrases, target_languages, source_language="english"):
-    """Translate phrases into all target languages silently. Returns flat list of all translations."""
-    non_english = [l for l in target_languages if l != source_language]
-    if not non_english:
-        return phrases
-    all_phrases = list(phrases)
-    lang_list   = ", ".join(non_english)
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": (
-            f"Translate each of the following phrases into these languages: {lang_list}.\n"
-            "Return a flat JSON array containing ALL translations (not the originals). "
-            "One entry per phrase per language. No explanations, no markdown, just the JSON array.\n\n"
-            f"Phrases: {json.dumps(phrases)}"
-        )}],
-        max_tokens=2000
-    )
-    try:
-        translations = json.loads(re.sub(r"```json|```", "", resp.choices[0].message.content.strip()).strip())
-        all_phrases.extend(translations)
-    except Exception:
-        pass  # if translation fails, just use original phrases
-    return list(dict.fromkeys(all_phrases))
-
-st.set_page_config(page_title="Query Builder", page_icon="🔍", layout="wide")
-st.title("🔍 Query Builder Tool")
-st.caption("AI-powered keyword discovery for social media & Brandwatch queries")
-
-# ── Session state ─────────────────────────────────────────────
-for key in ["concept_phrases", "phrases_from_objective", "phrases_ai_expansions",
-            "approved_keywords", "candidate_keywords",
-            "all_similarity_scores", "brandwatch_query", "pipeline_done",
-            "df_seed", "collection_name", "confirm_delete"]:
-    if key not in st.session_state:
-        st.session_state[key] = None
-
-# ── Helpers ───────────────────────────────────────────────────
 def batch_list(lst, size):
     it = iter(lst)
     return list(iter(lambda: list(islice(it, size)), []))
@@ -101,9 +120,7 @@ def embed_texts(client, texts, batch_size=500):
         vectors.extend([r.embedding for r in resp.data])
     return vectors
 
-def extract_ngrams(texts, max_n=4, freq_pct=0.2, stop_words=None):
-    if stop_words is None:
-        stop_words = set(stopwords.words("english"))
+def extract_ngrams(texts, stop_words, max_n=4, freq_pct=0.05):
     ngram_counts = Counter()
     for text in texts:
         tokens = word_tokenize(str(text).lower())
@@ -120,10 +137,83 @@ def extract_ngrams(texts, max_n=4, freq_pct=0.2, stop_words=None):
     kept = [g for g, c in ngram_counts.items() if c >= min_count]
     return kept, len(ngram_counts), min_count
 
+def translate_phrases_to_language(client, phrases, target_language):
+    """Translate a list of phrases into a single target language."""
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": (
+            f"Translate each of the following phrases into {target_language}. "
+            "Return a flat JSON array of translated strings only, same order, no explanations, no markdown.\n\n"
+            f"Phrases: {json.dumps(phrases)}"
+        )}],
+        max_tokens=2000
+    )
+    try:
+        return json.loads(re.sub(r"```json|```", "", resp.choices[0].message.content.strip()).strip())
+    except Exception:
+        return []
+
+def gpt_filter_keywords(client, candidates, objective, detected_langs_list):
+    """GPT filters a list of candidates for relevance, multilingual aware."""
+    MAX_TOKENS  = 25000
+    batches, current, tokens = [], [], 0
+    for term in candidates:
+        t = len(term) // 4
+        if tokens + t > MAX_TOKENS and current:
+            batches.append(current); current = [term]; tokens = t
+        else:
+            current.append(term); tokens += t
+    if current:
+        batches.append(current)
+
+    approved = []
+    for batch in batches:
+        for attempt in range(2):
+            try:
+                r = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": (
+                        f"Given this research objective: {objective}\n\n"
+                        f"The dataset contains text in: {', '.join(detected_langs_list)}. "
+                        "Keep terms in ANY of these languages if they are relevant to the objective. "
+                        "Do not filter out non-English terms just because they are not in English. "
+                        "Return ONLY genuinely relevant terms. Remove duplicates and overly generic terms. "
+                        "Return ONLY a flat JSON array of strings, no markdown.\n\n"
+                        f"Terms: {json.dumps(batch)}"
+                    )}],
+                    max_tokens=4000
+                )
+                approved.extend(json.loads(re.sub(r"```json|```", "", r.choices[0].message.content.strip()).strip()))
+                break
+            except Exception:
+                if attempt == 1:
+                    pass
+    return list(dict.fromkeys(approved))
+
+def cross_translate_keywords(client, keywords_by_lang, all_languages):
+    """
+    For each language, find keywords that exist in other languages but not this one,
+    translate them in, and merge.
+    """
+    # Collect all unique keywords across all languages
+    all_keywords = set()
+    for kws in keywords_by_lang.values():
+        all_keywords.update(kws)
+
+    enriched = {}
+    for lang in all_languages:
+        existing   = set(keywords_by_lang.get(lang, []))
+        missing    = all_keywords - existing
+        if missing and lang != "english":
+            translations = translate_phrases_to_language(client, list(missing), lang)
+            existing.update(translations)
+        enriched[lang] = list(existing)
+    return enriched
+
 # ── SIDEBAR ───────────────────────────────────────────────────
 with st.sidebar:
     st.header("🔑 Credentials")
-    st.caption("Stored in session only — never saved.")
+    st.caption("Session only — never saved.")
     openai_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
     qdrant_url = st.text_input("Qdrant URL", placeholder="https://xyz.qdrant.io")
     qdrant_key = st.text_input("Qdrant API Key", type="password", placeholder="your-qdrant-key")
@@ -133,20 +223,20 @@ with st.sidebar:
     similarity_threshold = st.slider("Similarity Threshold", 0.20, 0.80, 0.20, 0.05,
         help="Loose 0.20 — Balanced 0.45 — Strict 0.80")
     freq_pct = st.number_input("N-gram Frequency %", min_value=0.01, max_value=5.0, value=0.05, step=0.01,
-        help="N-grams must appear in at least this % of rows")
+        help="Per language slice — n-grams must appear in at least this % of that language's rows")
 
     st.divider()
     st.header("🗑️ Clean Database")
     if st.button("Delete All Collections", use_container_width=True):
         st.session_state["confirm_delete"] = True
     if st.session_state.get("confirm_delete"):
-        st.warning("Deletes ALL Qdrant collections. Cannot be undone.")
+        st.warning("Deletes ALL Qdrant collections.")
         c1, c2 = st.columns(2)
         with c1:
             if st.button("Yes, Delete", type="primary", use_container_width=True):
                 try:
                     client = QdrantClient(url=qdrant_url, api_key=qdrant_key)
-                    cols = client.get_collections().collections
+                    cols   = client.get_collections().collections
                     for c in cols:
                         client.delete_collection(c.name)
                     st.success(f"Deleted {len(cols)} collection(s).")
@@ -174,23 +264,19 @@ if uploaded_file:
     try:
         df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
         st.session_state["df_seed"] = df
-        min_count = max(1, int(len(df) * freq_pct / 100))
         st.success(f"✅ **{uploaded_file.name}** — {len(df):,} rows, {len(df.columns)} columns")
         selected_column = st.selectbox("Select the column containing your text data", df.columns.tolist())
-        st.caption(f"At {freq_pct}% → n-grams must appear in at least {min_count:,} rows")
     except Exception as e:
         st.error(f"Could not read file: {e}")
 
-# ── STEP 3a — Extract Concept Phrases ────────────────────────
-st.header("Step 3 — Run Pipeline")
+# ── STEP 3 — Extract Concept Phrases ─────────────────────────
+st.header("Step 3 — Extract Concept Phrases")
 
 if st.button("🔍 Extract Concept Phrases", type="primary",
              disabled=not (objective and selected_column and openai_key)):
     try:
         client_openai = openai.OpenAI(api_key=openai_key)
         with st.spinner("Extracting concept phrases..."):
-
-            # From objective
             resp_obj = client_openai.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": (
@@ -203,27 +289,25 @@ if st.button("🔍 Extract Concept Phrases", type="primary",
                 )}],
                 max_tokens=1000
             )
-            from_objective = json.loads(re.sub(r"```json|```", "", resp_obj.choices[0].message.content.strip()).strip())
+            from_obj = json.loads(re.sub(r"```json|```", "", resp_obj.choices[0].message.content.strip()).strip())
 
-            # AI expansions
             resp_exp = client_openai.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": (
                     "You are helping expand a keyword search query. "
                     "Based on the research objective below, suggest as many related concept phrases "
                     "(2-4 words each) as are relevant — covering adjacent topics, synonyms, subcategories, "
-                    "and related themes that the user did NOT explicitly mention but would likely want to capture. "
-                    "Do NOT repeat phrases already in the objective. "
-                    "Do NOT include exclusion criteria. "
+                    "and related themes the user did NOT explicitly mention but would likely want to capture. "
+                    "Do NOT repeat phrases from the objective. Do NOT include exclusion criteria. "
                     "Return only a JSON array of strings, nothing else.\n\n"
                     f"Objective: {objective}"
                 )}],
                 max_tokens=1000
             )
-            ai_expansions = json.loads(re.sub(r"```json|```", "", resp_exp.choices[0].message.content.strip()).strip())
+            ai_exp = json.loads(re.sub(r"```json|```", "", resp_exp.choices[0].message.content.strip()).strip())
 
-            st.session_state["phrases_from_objective"] = from_objective
-            st.session_state["phrases_ai_expansions"]  = ai_expansions
+            st.session_state["phrases_from_objective"] = from_obj
+            st.session_state["phrases_ai_expansions"]  = ai_exp
             st.session_state["pipeline_done"]          = False
 
     except openai.AuthenticationError:
@@ -231,177 +315,199 @@ if st.button("🔍 Extract Concept Phrases", type="primary",
     except Exception as e:
         st.error(f"Error: {e}")
 
-# ── STEP 3b — Review & Edit Concept Phrases ──────────────────
+# ── STEP 3b — Edit Concept Phrases ───────────────────────────
 if st.session_state.get("phrases_from_objective") is not None:
     st.subheader("Review Concept Phrases")
-    st.caption("Edit freely — one phrase per line. Delete a line to remove, type a new line to add. Both lists will be merged into your anchor vector.")
+    st.caption("Edit freely — one phrase per line. Both lists merge into your anchor vector.")
 
     col_obj, col_ai = st.columns(2)
-
     with col_obj:
         st.markdown("**📌 From your objective**")
-        obj_default = "\n".join(st.session_state["phrases_from_objective"])
-        obj_text    = st.text_area("From objective", value=obj_default, height=300,
-                                    key="ta_objective", label_visibility="collapsed")
-
+        obj_text = st.text_area("From objective",
+            value="\n".join(st.session_state["phrases_from_objective"]),
+            height=250, key="ta_obj", label_visibility="collapsed")
     with col_ai:
         st.markdown("**🤖 AI suggested expansions**")
-        ai_default = "\n".join(st.session_state["phrases_ai_expansions"])
-        ai_text    = st.text_area("AI expansions", value=ai_default, height=300,
-                                   key="ta_expansions", label_visibility="collapsed")
+        ai_text = st.text_area("AI expansions",
+            value="\n".join(st.session_state["phrases_ai_expansions"]),
+            height=250, key="ta_ai", label_visibility="collapsed")
 
-    # Merge both into flat deduplicated list
     obj_lines = [l.strip() for l in obj_text.splitlines() if l.strip()]
     ai_lines  = [l.strip() for l in ai_text.splitlines() if l.strip()]
-    updated_phrases = list(dict.fromkeys(obj_lines + ai_lines))
+    anchor_phrases = list(dict.fromkeys(obj_lines + ai_lines))
+    st.caption(f"{len(obj_lines)} from objective + {len(ai_lines)} AI suggestions = **{len(anchor_phrases)} total anchor phrases**")
 
-    st.caption(f"{len(obj_lines)} from objective + {len(ai_lines)} AI suggestions = **{len(updated_phrases)} total phrases** going into anchor vector")
+    # ── STEP 4 — Detect Languages & Label Data ────────────────
+    st.header("Step 4 — Detect Languages")
 
-    # ── STEP 3c — Run Full Pipeline ───────────────────────────
-    if st.button("▶ Run Pipeline with These Phrases", type="primary",
-                 disabled=len(updated_phrases) == 0):
-        df    = st.session_state["df_seed"]
-        texts = df[selected_column].dropna().astype(str).str.strip().replace("", pd.NA).dropna().tolist()
+    if st.button("🌍 Detect Languages & Label Data", type="primary",
+                 disabled=len(anchor_phrases) == 0):
+        df = st.session_state["df_seed"]
+        with st.spinner(f"Labeling {len(df):,} rows — this takes ~2 minutes for large datasets..."):
+            try:
+                labeled_df, detected = label_dataframe(df, selected_column)
+                st.session_state["labeled_df"]     = labeled_df
+                st.session_state["detected_langs"] = detected
+                st.session_state["pipeline_done"]  = False
+            except Exception as e:
+                st.error(f"Error during language detection: {e}")
 
-        pipeline_error = None
-        try:
-            client_openai = openai.OpenAI(api_key=openai_key)
-            client_qdrant = QdrantClient(url=qdrant_url, api_key=qdrant_key)
+    if st.session_state.get("detected_langs") is not None:
+        labeled_df  = st.session_state["labeled_df"]
+        detected    = st.session_state["detected_langs"]
 
-            with st.status("Running pipeline...", expanded=True) as status:
-                st.write("🧲 Embedding concept phrases...")
-                phrase_vectors = embed_texts(client_openai, updated_phrases)
-                anchor_vector  = list(np.mean(phrase_vectors, axis=0))
-                st.write("✅ Anchor vector ready.")
-                detected_langs_list = []  # will be set after language detection
+        st.subheader("Select Languages to Process")
+        st.caption("Only rows from selected languages will be used. Frequency filter applies per language slice.")
 
-                st.write(f"📄 Extracting n-grams from {len(texts):,} rows...")
-                st.write("🌍 Detecting languages in dataset...")
-                detected_langs = detect_languages(texts)
-                stop_words     = get_multilingual_stopwords(detected_langs)
-                st.write(f"✅ Languages detected: {', '.join(sorted(detected_langs))} — {len(stop_words):,} stopwords loaded.")
-                detected_langs_list = sorted(detected_langs)
-
-                st.write("🌐 Translating anchor phrases into detected languages...")
-                updated_phrases = translate_phrases(client_openai, updated_phrases, detected_langs)
-                st.write(f"✅ Anchor vector will use {len(updated_phrases)} phrases across all languages.")
-
-                ngrams, total, min_ct = extract_ngrams(texts, max_n=4, freq_pct=freq_pct, stop_words=stop_words)
-                st.write(f"✅ {total:,} unique n-grams → **{len(ngrams):,} kept** (min {min_ct:,} rows)")
-
-                st.write("☁️ Embedding & uploading to Qdrant...")
-                ts    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                cname = f"run_{ts}"
-                existing = [c.name for c in client_qdrant.get_collections().collections]
-                if cname in existing:
-                    cname += f"_{int(time.time()) % 10000}"
-                client_qdrant.create_collection(cname, vectors_config=VectorParams(size=1536, distance=Distance.COSINE))
-                st.write(f"Collection: `{cname}`")
-                st.session_state["collection_name"] = cname
-
-                ngram_vectors  = embed_texts(client_openai, ngrams)
-                prog           = st.progress(0)
-                upload_batches = batch_list(list(zip(ngrams, ngram_vectors)), 100)
-                for i, batch in enumerate(upload_batches):
-                    client_qdrant.upsert(cname, points=[
-                        PointStruct(id=abs(hash(g)) % (2**63), vector=v,
-                                    payload={"ngram": g, "ngram_length": len(g.split())})
-                        for g, v in batch
-                    ])
-                    prog.progress((i + 1) / len(upload_batches))
-                st.write("✅ Uploaded.")
-
-                st.write("🔎 Running similarity search...")
-                result     = client_qdrant.query_points(cname, query=anchor_vector,
-                                                        limit=min(len(ngrams), 10000), with_payload=True)
-                all_scores = {r.payload["ngram"]: round(r.score, 4) for r in result.points}
-                above      = {k: v for k, v in all_scores.items() if v >= similarity_threshold}
-                st.session_state["all_similarity_scores"] = all_scores
-                st.write(f"✅ {len(above):,} candidates above threshold {similarity_threshold:.2f}")
-
-                st.write("🤖 GPT keyword approval...")
-                candidates  = list(above.keys())
-                MAX_TOKENS  = 25000
-                gpt_batches, current, tokens = [], [], 0
-                for term in candidates:
-                    t = len(term) // 4
-                    if tokens + t > MAX_TOKENS and current:
-                        gpt_batches.append(current); current = [term]; tokens = t
-                    else:
-                        current.append(term); tokens += t
-                if current:
-                    gpt_batches.append(current)
-
-                approved = []
-                gpt_prog = st.progress(0)
-                for i, batch in enumerate(gpt_batches):
-                    st.write(f"Batch {i+1} of {len(gpt_batches)}...")
-                    for attempt in range(2):
-                        try:
-                            r = client_openai.chat.completions.create(
-                                model="gpt-4o-mini",
-                                messages=[{"role": "user", "content": (
-                                    f"Given this research objective: {objective}\n\n"
-                                    f"The dataset contains text in the following languages: {', '.join(detected_langs_list)}. "
-                                    "A term in ANY of these languages that is relevant to the objective should be kept, regardless of which language it is in. "
-                                    "Do not filter out non-English terms just because they are not in English. "
-                                    "From the following list of terms, return ONLY those genuinely relevant to the objective. "
-                                    "Remove duplicates, near-duplicates, and overly generic terms. "
-                                    "Return ONLY a flat JSON array of strings, no other text, no markdown.\n\n"
-                                    f"Terms: {json.dumps(batch)}"
-                                )}],
-                                max_tokens=4000
-                            )
-                            approved.extend(json.loads(re.sub(r"```json|```", "",
-                                r.choices[0].message.content.strip()).strip()))
-                            break
-                        except Exception:
-                            if attempt == 1:
-                                st.warning(f"Batch {i+1} skipped after retry.")
-                    gpt_prog.progress((i + 1) / len(gpt_batches))
-
-                st.session_state["candidate_keywords"] = list(dict.fromkeys(approved))
-                st.session_state["pipeline_done"]      = True
-                status.update(
-                    label=f"✅ Done — {len(st.session_state['candidate_keywords'])} keywords found",
-                    state="complete"
+        lang_counts = labeled_df["_lang"].value_counts().to_dict()
+        selected    = {}
+        cols        = st.columns(min(len(detected), 4))
+        for i, lang in enumerate(sorted(detected)):
+            count = lang_counts.get(lang, 0)
+            with cols[i % len(cols)]:
+                selected[lang] = st.checkbox(
+                    f"{lang.capitalize()} ({count:,} rows)",
+                    value=True, key=f"lang_{lang}"
                 )
 
-        except openai.AuthenticationError:
-            st.error("Invalid OpenAI API key.")
-        except Exception as e:
-            st.error(f"Error: {e}")
+        selected_langs = [l for l, v in selected.items() if v]
+        st.session_state["selected_langs"] = selected_langs
 
-# ── STEP 4 — Review Keywords ──────────────────────────────────
-if st.session_state.get("pipeline_done") and st.session_state["candidate_keywords"]:
-    st.header("Step 4 — Review & Approve Keywords")
+        if len(selected_langs) == 0:
+            st.warning("Select at least one language to continue.")
+        else:
+            st.caption(f"**{len(selected_langs)} language(s) selected** — pipeline will run once per language")
 
-    all_scores = st.session_state["all_similarity_scores"] or {}
-    candidates = st.session_state["candidate_keywords"]
+            # ── STEP 5 — Run Pipeline ─────────────────────────
+            st.header("Step 5 — Run Pipeline")
 
-    review_threshold = st.slider("Adjust threshold", 0.20, 0.80, similarity_threshold, 0.05,
-                                  key="review_threshold")
-    filtered = sorted(
-        [k for k in candidates if all_scores.get(k, 0) >= review_threshold],
-        key=lambda k: all_scores.get(k, 0), reverse=True
-    )
+            if st.button("▶ Run Pipeline", type="primary"):
+                df          = st.session_state["labeled_df"]
+                all_langs   = selected_langs
+                ts          = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    MIN_KEYWORDS = 20
-    st.caption(f"**{len(filtered)} keywords** at threshold {review_threshold:.2f} "
-               f"{'✅' if len(filtered) >= MIN_KEYWORDS else f'— need at least {MIN_KEYWORDS}'}")
+                try:
+                    client_openai = openai.OpenAI(api_key=openai_key)
+                    client_qdrant = QdrantClient(url=qdrant_url, api_key=qdrant_key)
+                    keywords_by_lang = {}
 
-    to_remove      = st.multiselect("Select keywords to remove", options=filtered, default=[])
-    final_keywords = [k for k in filtered if k not in to_remove]
-    st.caption(f"{len(final_keywords)} keywords will be approved")
+                    for lang in all_langs:
+                        st.markdown(f"---\n### 🌐 Processing: **{lang.capitalize()}**")
 
-    if st.button("✅ Approve Keywords", type="primary", disabled=len(final_keywords) < MIN_KEYWORDS):
-        st.session_state["approved_keywords"] = final_keywords
-        st.success(f"✅ {len(final_keywords)} keywords approved. Proceed to Step 5.")
+                        # Slice this language's rows
+                        lang_df    = df[df["_lang"] == lang]
+                        lang_texts = lang_df[selected_column].dropna().astype(str).tolist()
+                        st.write(f"Rows: {len(lang_texts):,}")
 
-# ── STEP 5 — Outputs ──────────────────────────────────────────
-if st.session_state.get("approved_keywords"):
-    st.header("Step 5 — Outputs")
-    approved = st.session_state["approved_keywords"]
+                        if len(lang_texts) < 10:
+                            st.warning(f"Too few rows for {lang}, skipping.")
+                            continue
+
+                        # Translate anchor phrases into this language
+                        st.write(f"🌐 Translating anchor phrases into {lang}...")
+                        if lang == "english":
+                            lang_phrases = anchor_phrases
+                        else:
+                            translated   = translate_phrases_to_language(client_openai, anchor_phrases, lang)
+                            lang_phrases = list(dict.fromkeys(anchor_phrases + translated))
+                        st.write(f"✅ {len(lang_phrases)} anchor phrases ready.")
+
+                        # Embed anchor → anchor vector
+                        st.write("🧲 Embedding anchor phrases...")
+                        phrase_vectors = embed_texts(client_openai, lang_phrases)
+                        anchor_vector  = list(np.mean(phrase_vectors, axis=0))
+                        st.write("✅ Anchor vector ready.")
+
+                        # N-gram extraction with language-specific stopwords
+                        st.write(f"📄 Extracting n-grams...")
+                        lang_stopwords = get_stopwords([lang, "english"])
+                        ngrams, total, min_ct = extract_ngrams(lang_texts, lang_stopwords, freq_pct=freq_pct)
+                        st.write(f"✅ {total:,} n-grams → **{len(ngrams):,} kept** (min {min_ct:,} rows)")
+
+                        if len(ngrams) == 0:
+                            st.warning(f"No n-grams survived frequency filter for {lang}. Try lowering the %.")
+                            continue
+
+                        # Embed & upload to Qdrant
+                        st.write("☁️ Embedding & uploading to Qdrant...")
+                        cname    = f"run_{ts}_{lang}"
+                        existing = [c.name for c in client_qdrant.get_collections().collections]
+                        if cname in existing:
+                            cname += f"_{int(time.time()) % 10000}"
+                        client_qdrant.create_collection(cname, vectors_config=VectorParams(size=1536, distance=Distance.COSINE))
+
+                        ngram_vectors  = embed_texts(client_openai, ngrams)
+                        prog           = st.progress(0)
+                        upload_batches = batch_list(list(zip(ngrams, ngram_vectors)), 100)
+                        for i, batch in enumerate(upload_batches):
+                            client_qdrant.upsert(cname, points=[
+                                PointStruct(id=abs(hash(g)) % (2**63), vector=v,
+                                            payload={"ngram": g, "ngram_length": len(g.split())})
+                                for g, v in batch
+                            ])
+                            prog.progress((i + 1) / len(upload_batches))
+                        st.write("✅ Uploaded.")
+
+                        # Similarity search
+                        st.write("🔎 Similarity search...")
+                        result     = client_qdrant.query_points(cname, query=anchor_vector,
+                                                                limit=min(len(ngrams), 10000), with_payload=True)
+                        all_scores = {r.payload["ngram"]: round(r.score, 4) for r in result.points}
+                        above      = [k for k, v in all_scores.items() if v >= similarity_threshold]
+                        st.write(f"✅ {len(above):,} candidates above threshold {similarity_threshold:.2f}")
+
+                        # GPT filtering
+                        st.write("🤖 GPT filtering...")
+                        approved = gpt_filter_keywords(client_openai, above, objective, sorted(detected))
+                        st.write(f"✅ **{len(approved)} keywords** approved for {lang.capitalize()}")
+                        keywords_by_lang[lang] = approved
+
+                    # Cross-translation
+                    st.markdown("---")
+                    st.write("🔄 Cross-translating keywords across languages...")
+                    enriched = cross_translate_keywords(client_openai, keywords_by_lang, all_langs)
+                    st.session_state["keywords_by_lang"] = enriched
+                    st.session_state["pipeline_done"]    = True
+
+                    total_kws = sum(len(v) for v in enriched.values())
+                    st.success(f"✅ Pipeline complete — {total_kws} keywords across {len(all_langs)} language(s)")
+
+                except openai.AuthenticationError:
+                    st.error("Invalid OpenAI API key.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+# ── STEP 6 — Review Keywords ──────────────────────────────────
+if st.session_state.get("pipeline_done") and st.session_state.get("keywords_by_lang"):
+    st.header("Step 6 — Review & Approve Keywords")
+    st.caption("Keywords grouped by language. Remove any you disagree with, then approve.")
+
+    keywords_by_lang = st.session_state["keywords_by_lang"]
+    approved_by_lang = {}
+    MIN_TOTAL        = 20
+
+    for lang, keywords in keywords_by_lang.items():
+        st.subheader(f"{lang.capitalize()} — {len(keywords)} keywords")
+        to_remove = st.multiselect(
+            f"Remove from {lang}",
+            options=keywords, default=[],
+            key=f"remove_{lang}"
+        )
+        approved_by_lang[lang] = [k for k in keywords if k not in to_remove]
+        st.caption(f"{len(approved_by_lang[lang])} keywords kept")
+
+    total_approved = sum(len(v) for v in approved_by_lang.values())
+    st.markdown(f"**Total: {total_approved} keywords across all languages**")
+
+    if st.button("✅ Approve All", type="primary", disabled=total_approved < MIN_TOTAL):
+        st.session_state["approved_by_lang"] = approved_by_lang
+        st.success(f"✅ {total_approved} keywords approved across {len(approved_by_lang)} language(s). Proceed to Step 7.")
+
+# ── STEP 7 — Outputs ──────────────────────────────────────────
+if st.session_state.get("approved_by_lang"):
+    st.header("Step 7 — Outputs")
+    approved_by_lang = st.session_state["approved_by_lang"]
+    all_approved     = [kw for kws in approved_by_lang.values() for kw in kws]
 
     if st.button("⚡ Generate Brandwatch Query", type="primary"):
         if not openai_key:
@@ -414,13 +520,13 @@ if st.session_state.get("approved_keywords"):
                         model="gpt-4o-mini",
                         messages=[{"role": "user", "content": (
                             f"Given this research objective: {objective}\n\n"
-                            f"Using only these approved keywords: {', '.join(approved)}\n\n"
-                            "Construct a Brandwatch boolean query using OR, AND, and NOT operators. "
-                            "Group related terms with OR inside parentheses. "
+                            f"Using only these approved keywords (multilingual): {', '.join(all_approved)}\n\n"
+                            "Construct a single Brandwatch boolean query using OR, AND, and NOT operators. "
+                            "The query should work across all languages — group related terms with OR. "
                             "Use NOT to exclude terms that contradict the objective. "
                             "Return only the query string, nothing else."
                         )}],
-                        max_tokens=1000
+                        max_tokens=2000
                     )
                     st.session_state["brandwatch_query"] = resp.choices[0].message.content.strip()
                 except Exception as e:
@@ -428,21 +534,28 @@ if st.session_state.get("approved_keywords"):
 
     if st.session_state.get("brandwatch_query"):
         bw_query = st.session_state["brandwatch_query"]
-        col1, col2 = st.columns(2)
 
-        with col1:
-            st.subheader("Social Media Keywords")
-            hashtag_mode = st.toggle("Hashtag mode (#CamelCase)")
-            social_list  = "\n".join(
-                ["#" + "".join(w.capitalize() for w in kw.split()) for kw in approved]
-                if hashtag_mode else approved
-            )
-            st.text_area("Copy your keywords", value=social_list, height=300, key="social_out")
+        # Social media — grouped by language
+        st.subheader("Social Media Keywords")
+        hashtag_mode = st.toggle("Hashtag mode (#CamelCase)")
+        lang_tabs    = st.tabs([l.capitalize() for l in approved_by_lang.keys()])
+        for tab, (lang, kws) in zip(lang_tabs, approved_by_lang.items()):
+            with tab:
+                if hashtag_mode:
+                    out = "\n".join(["#" + "".join(w.capitalize() for w in kw.split()) for kw in kws])
+                else:
+                    out = "\n".join(kws)
+                st.text_area(f"{lang}", value=out, height=200, key=f"social_{lang}")
 
-        with col2:
-            st.subheader("Brandwatch Query")
-            st.text_area("Copy your query", value=bw_query, height=300, key="bw_out")
+        st.subheader("Brandwatch Query")
+        st.text_area("Copy your query", value=bw_query, height=150, key="bw_out")
 
-        download_txt = f"=== SOCIAL MEDIA KEYWORDS ===\n{chr(10).join(approved)}\n\n=== BRANDWATCH QUERY ===\n{bw_query}\n"
-        st.download_button("💾 Download as .txt", data=download_txt,
+        # Download
+        lines = ["=== SOCIAL MEDIA KEYWORDS ==="]
+        for lang, kws in approved_by_lang.items():
+            lines.append(f"\n-- {lang.upper()} --")
+            lines.extend(kws)
+        lines.append("\n\n=== BRANDWATCH QUERY ===")
+        lines.append(bw_query)
+        st.download_button("💾 Download as .txt", data="\n".join(lines),
                            file_name="query_builder_output.txt", mime="text/plain")
