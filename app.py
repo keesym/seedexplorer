@@ -106,9 +106,9 @@ with st.sidebar:
 
     st.divider()
     st.header("⚙️ Settings")
-    similarity_threshold = st.slider("Similarity Threshold", 0.20, 0.80, 0.45, 0.05,
+    similarity_threshold = st.slider("Similarity Threshold", 0.10, 0.80, 0.20, 0.05,
         help="Loose 0.20 — Balanced 0.45 — Strict 0.80")
-    freq_pct = st.number_input("N-gram Frequency %", min_value=0.01, max_value=5.0, value=0.2, step=0.01,
+    freq_pct = st.number_input("N-gram Frequency %", min_value=0.01, max_value=5.0, value=0.05, step=0.01,
         help="N-grams must appear in at least this % of rows")
 
     st.divider()
